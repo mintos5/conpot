@@ -21,6 +21,10 @@
 import logging
 import re
 import sys
+
+from bacpypes.bvll import BVLPDU, OriginalUnicastNPDU, OriginalBroadcastNPDU
+from bacpypes.npdu import NPDU
+from bacpypes.pdu import Address as PduAddress
 from bacpypes.pdu import GlobalBroadcast
 import bacpypes.object
 from bacpypes.app import BIPSimpleApplication
@@ -70,7 +74,7 @@ class BACnetApp(BIPSimpleApplication):
         """
         parse the bacnet template for objects and their properties
         """
-        self.deviceIdentifier = int(dom.xpath("//bacnet/device_info/*")[1].text)
+        self.deviceIdentifier = ("device", int(dom.xpath("//bacnet/device_info/*")[1].text))
         device_property_list = dom.xpath("//bacnet/device_info/*")
         for prop in device_property_list:
             prop_key = prop.tag.lower().title()
@@ -174,7 +178,9 @@ class BACnetApp(BIPSimpleApplication):
         if execute:
             self._response_service = "IAmRequest"
             self._response = IAmRequest()
-            self._response.pduDestination = GlobalBroadcast()
+            # todo make possible to use both GlobalBroadcast or Unicast address
+            # self._response.pduDestination = GlobalBroadcast()
+            self._response.pduDestination = PduAddress(address)
             self._response.iAmDeviceIdentifier = self.deviceIdentifier
             # self._response.objectIdentifier = list(self.objectIdentifier.keys())[0][1]
             self._response.maxAPDULengthAccepted = int(
@@ -213,7 +219,9 @@ class BACnetApp(BIPSimpleApplication):
                     objName = self.objectIdentifier[obj].objectName
                     self._response_service = "IHaveRequest"
                     self._response = IHaveRequest()
-                    self._response.pduDestination = GlobalBroadcast()
+                    # todo make possible to use both GlobalBroadcast or Unicast address
+                    # self._response.pduDestination = GlobalBroadcast()
+                    self._response.pduDestination = PduAddress(address)
                     # self._response.deviceIdentifier = list(self.objectIdentifier.keys())[0][1]
                     self._response.deviceIdentifier = self.deviceIdentifier
                     self._response.objectIdentifier = obj[1]
@@ -351,7 +359,7 @@ class BACnetApp(BIPSimpleApplication):
                 )
                 self._response_service = "ErrorPDU"
                 self._response = ErrorPDU()
-                self._response.pduDestination = address
+                self._response.pduDestination = PduAddress(address)
                 return
         # ignore the following
         elif apdu_type.pduType == 0x2:
@@ -394,8 +402,26 @@ class BACnetApp(BIPSimpleApplication):
             return
         apdu = APDU()
         response_apdu.encode(apdu)
+        # add missing layers
+        # Network layer NPDU
+        npdu = NPDU()
+        apdu.encode(npdu)
+        pdu = PDU(user_data=npdu.pduUserData)
+        npdu.encode(pdu)
+        # Add Unicast or Broadcast NPDU
+        if pdu.pduDestination.addrType == PduAddress.localStationAddr:
+            # make an original unicast PDU
+            xpdu = OriginalUnicastNPDU(pdu, destination=pdu.pduDestination, user_data=pdu.pduUserData)
+        elif pdu.pduDestination.addrType == PduAddress.localBroadcastAddr:
+            # make an original broadcast PDU
+            xpdu = OriginalBroadcastNPDU(pdu, destination=pdu.pduDestination, user_data=pdu.pduUserData)
+        else:
+            raise RuntimeError("invalid destination address: {}".format(pdu.pduDestination))
+        # Bacnet Virtual Link
+        bvlpdu = BVLPDU()
+        xpdu.encode(bvlpdu)
         pdu = PDU()
-        apdu.encode(pdu)
+        bvlpdu.encode(pdu)
         if isinstance(response_apdu, RejectPDU) or isinstance(response_apdu, ErrorPDU):
             self.datagram_server.sendto(pdu.pduData, address)
         else:
