@@ -14,7 +14,12 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
-
+from bacpypes import bvll
+from bacpypes.bvll import BVLPDU, OriginalUnicastNPDU, OriginalBroadcastNPDU
+from bacpypes.errors import DecodingError
+from bacpypes.npdu import NPDU
+from bacpypes.pdu import Address as PduAddress
+from copy import deepcopy as _deepcopy
 from gevent import monkey
 
 monkey.patch_all()
@@ -40,6 +45,55 @@ from conpot.protocols.bacnet import bacnet_server
 from conpot.utils.greenlet import spawn_test_server, teardown_test_server
 
 
+def process_apdu(apdu):
+    # add missing layers
+    # Network layer NPDU
+    npdu = NPDU()
+    apdu.encode(npdu)
+    pdu = PDU(user_data=npdu.pduUserData)
+    npdu.encode(pdu)
+    # Add Unicast or Broadcast NPDU
+    if pdu.pduDestination.addrType == PduAddress.localStationAddr:
+        # make an original unicast PDU
+        xpdu = OriginalUnicastNPDU(pdu, destination=pdu.pduDestination, user_data=pdu.pduUserData)
+    elif pdu.pduDestination.addrType == PduAddress.localBroadcastAddr:
+        # make an original broadcast PDU
+        xpdu = OriginalBroadcastNPDU(pdu, destination=pdu.pduDestination, user_data=pdu.pduUserData)
+    else:
+        raise RuntimeError("invalid destination address: {}".format(pdu.pduDestination))
+    # Bacnet Virtual Link
+    bvlpdu = BVLPDU()
+    xpdu.encode(bvlpdu)
+    return bvlpdu
+
+
+def get_apdu(data, address):
+    # remove not-tested layers
+    pdu = PDU(bytearray(data), source=PduAddress(address))
+    # interpret as a BVLL PDU
+    bvlpdu = bvll.BVLPDU()
+    try:
+        bvlpdu.decode(pdu)
+    except Exception:
+        raise
+    # get the class related to the function
+    rpdu = bvll.bvl_pdu_types[bvlpdu.bvlciFunction]()
+    try:
+        rpdu.decode(bvlpdu)
+    except Exception:
+        raise
+    # add missing NPDU
+    npdu = NPDU(user_data=rpdu.pduUserData)
+    npdu.decode(rpdu)
+    # get final APDU
+    apdu = APDU()
+    try:
+        apdu.decode(_deepcopy(npdu))
+    except DecodingError:
+        raise
+    return apdu
+
+
 class TestBACnetServer(unittest.TestCase):
 
     """
@@ -62,10 +116,12 @@ class TestBACnetServer(unittest.TestCase):
         request = WhoIsRequest(
             deviceInstanceRangeLowLimit=500, deviceInstanceRangeHighLimit=50000
         )
+        request.pduDestination = PduAddress(self.address)
         apdu = APDU()
         request.encode(apdu)
         pdu = PDU()
-        apdu.encode(pdu)
+        # apdu.encode(pdu)
+        process_apdu(apdu).encode(pdu)
         buf_size = 1024
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.sendto(pdu.pduData, self.address)
@@ -75,7 +131,7 @@ class TestBACnetServer(unittest.TestCase):
 
         expected = IAmRequest()
         expected.pduDestination = GlobalBroadcast()
-        expected.iAmDeviceIdentifier = 36113
+        expected.iAmDeviceIdentifier = ('device', 36113)
         expected.maxAPDULengthAccepted = 1024
         expected.segmentationSupported = "segmentedBoth"
         expected.vendorID = 15
@@ -85,16 +141,21 @@ class TestBACnetServer(unittest.TestCase):
         exp_pdu = PDU()
         exp_apdu.encode(exp_pdu)
 
-        self.assertEqual(exp_pdu.pduData, received_data)
+        rec_pdu = PDU()
+        get_apdu(received_data, GlobalBroadcast()).encode(rec_pdu)
+
+        self.assertEqual(exp_pdu.pduData, rec_pdu.pduData)
 
     def test_whoHas(self):
         request_object = WhoHasObject()
         request_object.objectIdentifier = ("binaryInput", 12)
         request = WhoHasRequest(object=request_object)
+        request.pduDestination = PduAddress(self.address)
         apdu = APDU()
         request.encode(apdu)
         pdu = PDU()
-        apdu.encode(pdu)
+        # apdu.encode(pdu)
+        process_apdu(apdu).encode(pdu)
         buf_size = 1024
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.sendto(pdu.pduData, self.address)
@@ -104,7 +165,7 @@ class TestBACnetServer(unittest.TestCase):
 
         expected = IHaveRequest()
         expected.pduDestination = GlobalBroadcast()
-        expected.deviceIdentifier = 36113
+        expected.deviceIdentifier = ('device', 36113)
         expected.objectIdentifier = 12
         expected.objectName = "BI 01"
 
@@ -112,7 +173,11 @@ class TestBACnetServer(unittest.TestCase):
         expected.encode(exp_apdu)
         exp_pdu = PDU()
         exp_apdu.encode(exp_pdu)
-        self.assertEqual(exp_pdu.pduData, received_data)
+
+        rec_pdu = PDU()
+        get_apdu(received_data, GlobalBroadcast()).encode(rec_pdu)
+
+        self.assertEqual(exp_pdu.pduData, rec_pdu.pduData)
 
     def test_readProperty(self):
         request = ReadPropertyRequest(
@@ -120,10 +185,12 @@ class TestBACnetServer(unittest.TestCase):
         )
         request.apduMaxResp = 1024
         request.apduInvokeID = 101
+        request.pduDestination = PduAddress(self.address)
         apdu = APDU()
         request.encode(apdu)
         pdu = PDU()
-        apdu.encode(pdu)
+        # apdu.encode(pdu)
+        process_apdu(apdu).encode(pdu)
         buf_size = 1024
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.sendto(pdu.pduData, self.address)
@@ -144,7 +211,10 @@ class TestBACnetServer(unittest.TestCase):
         exp_pdu = PDU()
         exp_apdu.encode(exp_pdu)
 
-        self.assertEqual(exp_pdu.pduData, received_data)
+        rec_pdu = PDU()
+        get_apdu(received_data, GlobalBroadcast()).encode(rec_pdu)
+
+        self.assertEqual(exp_pdu.pduData, rec_pdu.pduData)
 
     def test_no_response_requests(self):
         """When the request has apduType not 0x01, no reply should be returned from Conpot"""
@@ -154,6 +224,7 @@ class TestBACnetServer(unittest.TestCase):
         request.pduData = bytearray(b"test_data")
         request.apduMaxResp = 1024
         request.apduInvokeID = 101
+        request.pduDestination = PduAddress(self.address)
         # Build requests - Confirmed, simple ack pdu, complex ack pdu, error pdu - etc.
         test_requests = list()
 
@@ -176,8 +247,12 @@ class TestBACnetServer(unittest.TestCase):
                     # when apdu.apduType is 7 - we have AbortPDU
                     # set the apduInvokeID and apduAbortRejectReason
                     request.apduAbortRejectReason = 9
-
-                test_requests.append(request)
+                apdu = APDU()
+                request.encode(apdu)
+                pdu = PDU()
+                # apdu.encode(pdu)
+                process_apdu(apdu).encode(pdu)
+                test_requests.append(pdu)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
         buf_size = 1024
