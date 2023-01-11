@@ -23,13 +23,13 @@ import re
 import sys
 
 from bacpypes.bvll import BVLPDU, OriginalUnicastNPDU, OriginalBroadcastNPDU
+from bacpypes.errors import ExecutionError
 from bacpypes.npdu import NPDU
 from bacpypes.pdu import Address as PduAddress
 from bacpypes.pdu import GlobalBroadcast
 import bacpypes.object
 from bacpypes.app import BIPSimpleApplication
-from bacpypes.constructeddata import Any, Array, List
-from bacpypes.primitivedata import Atomic
+from bacpypes.constructeddata import Any
 from bacpypes.constructeddata import InvalidParameterDatatype
 from bacpypes.apdu import (
     APDU,
@@ -46,6 +46,7 @@ from bacpypes.apdu import (
     Error
 )
 from bacpypes.pdu import PDU
+from bacpypes.service import object as BacpypesServiceObject
 import ast
 
 logger = logging.getLogger(__name__)
@@ -111,7 +112,13 @@ class BACnetApp(BIPSimpleApplication):
                     prop_val = prop.text.lower().title()
                     prop_val = re.sub(" ", "", prop_val)
                     prop_val = prop_val[0].lower() + prop_val[1:]
-                prop_val = prop.text
+                elif prop_key == "presentValue":
+                    try:
+                        prop_val = float(prop.text)
+                    except ValueError:
+                        prop_val = prop.text
+                else:
+                    prop_val = prop.text
                 try:
                     if prop_key == "objectIdentifier":
                         device_object.objectIdentifier = int(prop_val)
@@ -234,7 +241,7 @@ class BACnetApp(BIPSimpleApplication):
 
     def readProperty(self, request, address, invoke_key, device):
         # Read Property
-        # TODO: add support for PropertyArrayIndex handling;
+        # TODO: add support/testing for PropertyArrayIndex handling;
         for obj in device.objectList.value[1:]:
             if (
                 (int(request.objectIdentifier[1]) == 4194303 or int(request.objectIdentifier[1]) == obj[1])
@@ -242,82 +249,55 @@ class BACnetApp(BIPSimpleApplication):
             ):
                 # check if it is a root device or something from object list
                 if obj in self.objectIdentifier:
-                    objName = self.objectIdentifier[obj].objectName
-                    for prop in self.objectIdentifier[obj].properties:
-                        if request.propertyIdentifier == prop.identifier:
-                            propName = prop.identifier
-                            propValue = prop.ReadProperty(self.objectIdentifier[obj])
-                            propType = prop.datatype()
-                            self._response_service = "ComplexAckPDU"
-                            self._response = ReadPropertyACK()
-                            self._response.pduDestination = PduAddress(address)
-                            self._response.apduInvokeID = invoke_key
-                            self._response.objectIdentifier = obj
-                            self._response.objectName = objName
-                            self._response.propertyIdentifier = propName
 
-                            # get the property type
-                            for p in dir(sys.modules[propType.__module__]):
-                                _obj = getattr(sys.modules[propType.__module__], p)
-                                try:
-                                    if type(propType) == _obj:
-                                        break
-                                except TypeError:
-                                    pass
-                            if propValue:
-                                value = ast.literal_eval(propValue)
-                            else:
-                                value = propValue  # fix for None in eval
-                            self._response.propertyValue = Any(_obj(value))
-                            # self._response.propertyValue.cast_in(objPropVal)
-                            # self._response.debug_contents()
+                    # getting properties from objects in object list (self.objectIdentifier)
+                    try:
+                        property_value = BacpypesServiceObject.read_property_to_any(self.objectIdentifier[obj],
+                                                                                    request.propertyIdentifier,
+                                                                                    request.propertyArrayIndex)
+                    except ExecutionError as e:
+                        # return empty string instead of error unknownProperty
+                        if e.errorCode == "unknownProperty":
+                            datatype = self.objectIdentifier[obj].get_datatype(request.propertyIdentifier)
+                            property_value = Any()
+                            property_value.cast_in(datatype(None))
+                        else:
+                            self._response = Error(errorClass=e.errorClass, errorCode=e.errorCode, context=request)
                             break
-                    else:
-                        logger.info(
-                            "Bacnet ReadProperty: object has no property %s",
-                            request.propertyIdentifier,
-                        )
-                        # self._response = ErrorPDU()
-                        # self._response.pduDestination = PduAddress(address)
-                        # self._response.apduInvokeID = invoke_key
-                        # self._response.apduService = 0x0C
-                        # self._response.errorClass
-                        # self._response.errorCode
-                        self._response = Error(errorClass="property", errorCode="unknownProperty", context=request)
+
+                    self._response_service = "ComplexAckPDU"
+                    self._response = ReadPropertyACK()
+                    self._response.pduDestination = PduAddress(address)
+                    self._response.apduInvokeID = invoke_key
+                    self._response.objectIdentifier = obj
+                    self._response.objectName = self.objectIdentifier[obj].objectName
+                    self._response.propertyIdentifier = request.propertyIdentifier
+                    self._response.propertyValue = property_value
                     break
                 else:
                     # getting properties from root device (self.localDevice)
-                    # get the datatype
-                    datatype = self.localDevice.get_datatype(request.propertyIdentifier)
-                    # get the value
-                    value = self.localDevice.ReadProperty(request.propertyIdentifier, request.propertyArrayIndex)
-                    if datatype is None:
-                        logger.info(
-                            "Bacnet ReadProperty: root device has no property %s",
-                            request.propertyIdentifier,
-                        )
-                        # self._response = ErrorPDU(errorClass='property', errorCode='unknownProperty')
-                        # self._response.pduDestination = PduAddress(address)
-                        # self._response.apduInvokeID = invoke_key
-                        # self._response.apduService = request.apduService
-                        self._response = Error(errorClass="property", errorCode="unknownProperty", context=request)
-                    else:
-                        # change atomic values into something encodeable
-                        if issubclass(datatype, Atomic) or (
-                                issubclass(datatype, (Array, List)) and isinstance(value, list)):
-                            value = datatype(value)
+                    try:
+                        property_value = BacpypesServiceObject.read_property_to_any(self.localDevice,
+                                                                                    request.propertyIdentifier,
+                                                                                    request.propertyArrayIndex)
+                    except ExecutionError as e:
+                        # return empty/None instead of error unknownProperty
+                        if e.errorCode == "unknownProperty":
+                            datatype = self.localDevice.get_datatype(request.propertyIdentifier)
+                            property_value = Any()
+                            property_value.cast_in(datatype(None))
                         else:
-                            logger.error("Datatype %s for bacnet is not implemented", str(datatype))
+                            self._response = Error(errorClass=e.errorClass, errorCode=e.errorCode, context=request)
+                            break
 
-                        self._response_service = "ComplexAckPDU"
-                        self._response = ReadPropertyACK()
-                        self._response.pduDestination = PduAddress(address)
-                        self._response.apduInvokeID = invoke_key
-                        self._response.objectIdentifier = obj
-                        self._response.objectName = "root???"
-                        self._response.propertyIdentifier = request.propertyIdentifier
-                        self._response.propertyValue = Any()
-                        self._response.propertyValue.cast_in(value)
+                    self._response_service = "ComplexAckPDU"
+                    self._response = ReadPropertyACK()
+                    self._response.pduDestination = PduAddress(address)
+                    self._response.apduInvokeID = invoke_key
+                    self._response.objectIdentifier = obj
+                    # self._response.objectName = ""
+                    self._response.propertyIdentifier = request.propertyIdentifier
+                    self._response.propertyValue = property_value
                     break
 
         else:
@@ -325,10 +305,6 @@ class BACnetApp(BIPSimpleApplication):
                 "Bacnet ReadProperty: object %s doesn't exist",
                 request.objectIdentifier[0],
             )
-            # self._response = ErrorPDU()
-            # self._response.pduDestination = PduAddress(address)
-            # self._response.apduInvokeID = invoke_key
-            # self._response.apduService = 0x0C
             self._response = Error(errorClass="object", errorCode="unknownObject", context=request)
 
     def indication(self, apdu, address, device):
