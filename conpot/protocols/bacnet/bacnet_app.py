@@ -43,11 +43,15 @@ from bacpypes.apdu import (
     ReadPropertyACK,
     ConfirmedServiceChoice,
     UnconfirmedServiceChoice,
-    Error
+    Error,
+    ReadPropertyMultipleACK,
+    ReadAccessResult,
+    ReadAccessResultElement,
+    ReadAccessResultElementChoice
 )
 from bacpypes.pdu import PDU
 from bacpypes.service import object as BacpypesServiceObject
-import ast
+from bacpypes.basetypes import ErrorType
 
 logger = logging.getLogger(__name__)
 
@@ -306,6 +310,142 @@ class BACnetApp(BIPSimpleApplication):
                 request.objectIdentifier[0],
             )
             self._response = Error(errorClass="object", errorCode="unknownObject", context=request)
+
+    def readPropertyMultiple(self, request, address, invoke_key, device):
+        # Respond to a ReadPropertyMultiple Request.
+
+        # response is a list of read access results (or an error)
+        read_access_result_list = []
+
+        # loop through the request
+        for read_access_spec in request.listOfReadAccessSpecs:
+            # get the object identifier
+            objectIdentifier = read_access_spec.objectIdentifier
+
+            obj = None
+            # check for wildcard
+            if (objectIdentifier == ('device', 4194303) or objectIdentifier == self.localDevice.objectIdentifier) and self.localDevice is not None:
+                objectIdentifier = self.localDevice.objectIdentifier
+                obj = self.localDevice
+            else:
+                # get the object
+                for device_obj in device.objectList.value[2:]:
+                    if objectIdentifier == device_obj:
+                        obj = self.objectIdentifier[device_obj]
+                        break
+
+            # build a list of result elements
+            read_access_result_element_list = []
+
+            # loop through the property references
+            for prop_reference in read_access_spec.listOfPropertyReferences:
+                # get the property identifier
+                propertyIdentifier = prop_reference.propertyIdentifier
+
+                # get the array index (optional)
+                propertyArrayIndex = prop_reference.propertyArrayIndex
+
+                # check for special property identifiers
+                if propertyIdentifier in ('all', 'required', 'optional'):
+                    if not obj:
+                        # build a property access error
+                        read_result = ReadAccessResultElementChoice()
+                        read_result.propertyAccessError = ErrorType(errorClass='object', errorCode='unknownObject')
+
+                        # make an element for this error
+                        read_access_result_element = ReadAccessResultElement(
+                            propertyIdentifier=propertyIdentifier,
+                            propertyArrayIndex=propertyArrayIndex,
+                            readResult=read_result,
+                        )
+
+                        # add it to the list
+                        read_access_result_element_list.append(read_access_result_element)
+                    else:
+                        for propId, prop in obj._properties.items():
+
+                            # skip propertyList for ReadPropertyMultiple
+                            if (propId == 'propertyList'):
+                                continue
+
+                            if (propertyIdentifier == 'all'):
+                                pass
+                            elif (propertyIdentifier == 'required') and (prop.optional):
+                                continue
+                            elif (propertyIdentifier == 'optional') and (not prop.optional):
+                                continue
+
+                            try:
+                                # read the specific property
+                                read_access_result_element = BacpypesServiceObject.read_property_to_result_element(obj,
+                                                                                                                   propId,
+                                                                                                                   propertyArrayIndex)
+                            except Exception as e:
+                                logger.exception("Bacnet exception in readPropertyMultiple")
+                                # build a property access error
+                                read_result = ReadAccessResultElementChoice()
+                                read_result.propertyAccessError = ErrorType(errorClass='object',
+                                                                            errorCode='unknownObject')
+
+                                # make an element for this error
+                                read_access_result_element = ReadAccessResultElement(
+                                    propertyIdentifier=propId,
+                                    propertyArrayIndex=propertyArrayIndex,
+                                    readResult=read_result,
+                                )
+
+                            # check for undefined property
+                            if read_access_result_element.readResult.propertyAccessError \
+                                    and read_access_result_element.readResult.propertyAccessError.errorCode == 'unknownProperty':
+                                continue
+
+                            # add it to the list
+                            read_access_result_element_list.append(read_access_result_element)
+
+                else:
+                    try:
+                        # read the specific property
+                        read_access_result_element = BacpypesServiceObject.read_property_to_result_element(obj, propertyIdentifier,
+                                                                                     propertyArrayIndex)
+                    except Exception as e:
+                        # better to respond with error than with nothing
+                        logger.exception("Bacnet exception in readPropertyMultiple")
+                        # build a property access error
+                        read_result = ReadAccessResultElementChoice()
+                        read_result.propertyAccessError = ErrorType(errorClass='object',
+                                                                    errorCode='unknownObject')
+
+                        # make an element for this error
+                        read_access_result_element = ReadAccessResultElement(
+                            propertyIdentifier=propertyIdentifier,
+                            propertyArrayIndex=propertyArrayIndex,
+                            readResult=read_result,
+                        )
+
+                    # check for undefined property
+                    if read_access_result_element.readResult.propertyAccessError \
+                            and read_access_result_element.readResult.propertyAccessError.errorCode == 'unknownProperty':
+                        continue
+                    # add it to the list
+                    read_access_result_element_list.append(read_access_result_element)
+
+            # build a read access result
+            read_access_result = ReadAccessResult(
+                objectIdentifier=objectIdentifier,
+                listOfResults=read_access_result_element_list
+            )
+
+            # add it to the list
+            read_access_result_list.append(read_access_result)
+
+        # this is a ReadPropertyMultiple ack:
+        self._response_service = "ComplexAckPDU"
+        self._response = ReadPropertyMultipleACK(context=request)
+        # self._response.pduDestination = PduAddress(address)
+        # self._response.apduInvokeID = invoke_key
+        # self._response.objectIdentifier = obj
+        # self._response.objectName = ""
+        self._response.listOfReadAccessResults = read_access_result_list
 
     def indication(self, apdu, address, device):
         """logging the received PDU type and Service request"""
